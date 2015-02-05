@@ -1,0 +1,2 @@
+This is Bitcoin miner subnet report system, which sending report in MySQL-like
+plus CSV formats to particular emails.

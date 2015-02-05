@@ -1,0 +1,242 @@
+#!/usr/bin/env ruby
+# Copyright 2015 Ivan Bondarev
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+require 'socket'
+require 'json'
+require 'csv'
+require 'psych'
+
+require 'text-table'
+require 'mail'
+
+
+class API
+  def initialize(ip = '127.0.0.1', port = 4028)
+    @ip = ip
+    @port = port.to_i
+  end
+
+  def summary
+    make_request 'summary'
+  end
+
+  def pools
+    make_request 'pools'
+  end
+
+  def stats
+    make_request 'stats'
+  end
+
+  def devs
+    make_request 'devs'
+  end
+
+  def config
+    make_request 'config'
+  end
+
+  private
+
+    def make_request(command, parameter = nil)
+      s = TCPSocket.open @ip, @port
+
+      if parameter == nil
+        s.write({:command   => command}.to_json)
+      else
+        s.write({:command   => command,
+                 :parameter => parameter}.to_json)
+      end
+
+      response = s.read.strip
+      s.close
+      JSON.parse response
+    end # API.@make_request
+end
+
+class Report
+
+  @@header = ['Device IP', 'Status', 'Hashrate (MH/s)', 'Pool', 'Account']
+
+  def self.host_info(ip)
+    info = {}
+    api = API.new ip
+
+    begin
+      summary = api.summary['SUMMARY'][0]
+      pools = api.pools['POOLS']
+      pools.each do |pool|
+        if pool['Status'] == 'Alive'
+          info.merge!({'URL'  => pool['URL'],
+                       'User' => pool['User']})
+        end
+      end
+      info['MHS av'] = summary['MHS av']
+    rescue Errno::EHOSTUNREACH, Errno::ECONNREFUSED, Errno::ETIMEDOUT => e
+      info = e.exception.class.name.split(':')[2]
+    end
+
+    info
+  end # Report::host_info
+
+  def self.info_to_a(ip, info_json)
+    status = ''
+
+    if info_json == 'ECONNREFUSED'
+      status = 'Connection refused'
+    elsif info_json == 'EHOSTUNREACH'
+      status = 'Down'
+    elsif info_json.is_a? Hash
+      status = 'Running'
+    else
+      status = 'Unknown'
+    end
+
+    row = []
+    if status == 'Running'
+      row = [ip, status, info_json['MHS av'], info_json['URL'], info_json['User']]
+    else
+      row = [ip, status, '-', '-', '-']
+    end
+
+    row
+  end # Report::info_to_a
+
+  def self.table_report(data)
+    table = Text::Table.new(:head => @@header, :rows => data)
+    table.to_s
+  end # Report::table_report
+
+  def self.csv_report(data)
+    CSV.generate :force_quotes => true do |csv|
+      csv << @@header
+      data.each do |row|
+        csv << row
+      end
+    end
+  end # Report::csv_report
+
+  def self.load_opts(file)
+    Psych.load_file(file)
+  end # Report::load_opts
+
+  def self.send(from, to, subject, body, attachments, smtp_opts)
+    Mail.defaults do
+      delivery_method :smtp, smtp_opts
+    end
+
+    mail = Mail.new do
+      from      from
+      to        to
+      subject   "Miner status report - #{Date.today.to_s}"
+
+      text_part do
+        body body
+      end
+    end
+
+    if attachments.is_a? Hash
+      attachments.each do |name, data|
+        mail.attachments[name] = data
+      end
+    else
+      raise ArgumentError, "Can't handle attachments. Not a Hash."
+    end
+
+    mail.deliver!
+  end # Report::send
+
+  def self.scan_iprange(start_ip, range, hashrate_multiplier = 1)
+    raise ArgumentError, 'Range should be 0..254' unless range > 1
+    raise ArgumentError, 'Range value is too high' unless range < 255
+
+    last_octet = start_ip.split('.')[3].to_i
+    raise ArgumentError, "Start IP is not valid" unless last_octet > 0 and last_octet < 255
+    raise ArgumentError, "Expected IP range is too high" unless last_octet + range < 256
+
+    net = "#{start_ip.rpartition('.')[0]}."
+    json_data = {}
+    data = []
+    
+    range.times do |i|
+      ip = "#{net}#{last_octet + i}"
+      json_data[ip] = Report::host_info ip
+      json_data[ip]['MHS av'] *= hashrate_multiplier if json_data[ip]['MHS av'] != nil
+      row = Report::info_to_a ip, json_data[ip]
+      data << row
+    end
+
+    data
+  end # Report::scan_iprange
+
+  def self.run_lynx
+    lynx_data = scan_iprange "10.12.3.1", 254
+    lynx_t = table_report lynx_data
+    lynx_c = csv_report lynx_data
+
+    return lynx_t, lynx_c
+  end
+
+  def self.run_alma
+    alma_data = []
+    alma_ipranges = [ ["10.12.2.1", 254],
+                      ["10.12.4.1", 254],
+                      ["10.12.5.1", 254],
+                      ["10.12.6.1", 254],
+                      ["10.12.7.1", 254],
+                      ["10.12.8.1", 254] ]
+    alma_ipranges.each do |iprg|
+      alma_data.concat scan_iprange iprg[0], iprg[1]
+    end
+
+    alma_t = table_report alma_data
+    alma_c = csv_report alma_data
+
+    return alma_t, alma_c
+  end
+
+  def self.run_china
+    china_data = []
+    [["10.12.12.2", 253], ["10.12.13.1", 254]].each do |iprg|
+      china_data.concat scan_iprange iprg[0], iprg[1], 9
+    end
+    china_t = table_report china_data
+    china_c = csv_report china_data
+
+    return china_t, china_c
+  end
+
+  def self.run(conf_file)
+    opts = load_opts conf_file
+    today = Date.today.to_s
+
+    lynx = run_lynx
+    alma = run_alma
+    china = run_china
+    body = " Lynx\n#{lynx[0]}\n Almenda\n#{alma[0]}\n China\n#{china[0]}"
+    send(opts[:mail][:from],
+         opts[:mail][:to],
+         opts[:mail][:subject],
+         body,
+         { "lynx_report_#{today}.csv"  => lynx[1],
+           "china_report_#{today}.csv" => china[1],
+           "almenda_report_#{today}.csv"  => alma[1] },
+         opts[:smtp])
+  end
+end
+
+
+# Main
+Report::run ARGV[0]

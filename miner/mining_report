@@ -13,13 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-require 'socket'
-require 'json'
 require 'csv'
+require 'json'
 require 'psych'
+require 'socket'
 
-require 'text-table'
 require 'mail'
+require 'text-table'
 
 
 class API
@@ -68,23 +68,33 @@ end
 
 class Report
 
-  @@header = ['Device IP', 'Status', 'Hashrate (MH/s)', 'Pool', 'Account']
+  @@device_types = ['lynx', 'almenda', 'china']
+  @@header       = ['Device IP', 'Status', 'Hashrate (MH/s)', 'Active Pool', 'Account']
+  @@sum_header   = ['Devices type', 'Alive', 'Dead', 'Connection refused', 'Hashrate (MH/s)']
+
+  def self.errputs(msg, level = 'info')
+    $stderr.puts "#{Time.now} #{level.upcase} #{msg}"
+  end
 
   def self.host_info(ip)
-    info = {}
+    info = {'MHS av' => 0.0,
+            'URL'    => '',
+            'User'   => ''}
     api = API.new ip
 
     begin
       summary = api.summary['SUMMARY'][0]
       pools = api.pools['POOLS']
       pools.each do |pool|
-        if pool['Status'] == 'Alive'
-          info.merge!({'URL'  => pool['URL'],
-                       'User' => pool['User']})
+        if pool['Stratum Active']
+          info.merge!({'URL'  => pool['URL'] || '-',
+                       'User' => pool['User'] || '-'})
         end
       end
       info['MHS av'] = summary['MHS av']
-    rescue Errno::EHOSTUNREACH, Errno::ECONNREFUSED, Errno::ETIMEDOUT => e
+    rescue Errno::ECONNREFUSED,
+           Errno::EHOSTUNREACH,
+           Errno::ETIMEDOUT => e
       info = e.exception.class.name.split(':')[2]
     end
 
@@ -115,8 +125,7 @@ class Report
   end # Report::info_to_a
 
   def self.table_report(data)
-    table = Text::Table.new(:head => @@header, :rows => data)
-    table.to_s
+    Text::Table.new(:head => @@header, :rows => data).to_s
   end # Report::table_report
 
   def self.csv_report(data)
@@ -128,11 +137,49 @@ class Report
     end
   end # Report::csv_report
 
+  def self.summary_report(data = {})
+    rows = []
+    total_alive    = 0
+    total_dead     = 0
+    total_down     = 0
+    total_hashrate = 0.0
+
+    data.each do |dev_type, dev_data|
+      sum_alive    = 0
+      sum_dead     = 0
+      sum_down     = 0
+      sum_hashrate = 0.0
+
+      dev_data.each do |dev|
+        if dev[1] == 'Running'
+          sum_alive += 1
+          sum_hashrate += dev[2]
+        elsif dev[1] == 'Connection refused'
+          sum_down += 1
+        else
+          sum_dead += 1
+        end
+      end
+
+      total_alive    += sum_alive
+      total_dead     += sum_dead
+      total_down     += sum_down
+      total_hashrate += sum_hashrate
+
+      rows << [dev_type.capitalize, sum_alive, sum_dead, sum_down, sum_hashrate]
+    end
+    rows << :separator
+    rows << ['Total', total_alive, total_dead, total_down, total_hashrate]
+
+    Text::Table.new(:head => @@sum_header,
+                    :rows => rows).to_s
+  end # Report::summary_report
+
   def self.load_opts(file)
     Psych.load_file(file)
   end # Report::load_opts
 
-  def self.send(from, to, subject, body, attachments, smtp_opts)
+  def self.send_report(from, to, subject, body, attachments, smtp_opts)
     Mail.defaults do
       delivery_method :smtp, smtp_opts
     end
@@ -156,9 +203,14 @@ class Report
     end
 
     mail.deliver!
-  end # Report::send
+  end # Report::send_report
 
-  def self.scan_iprange(start_ip, range, hashrate_multiplier = 1)
+  # Returning value is array of arrays
+  # [IP, Status, MHS av, Pool URL, Pool User]
+  def self.scan_iprange(start_ip, range, options ={})
+    exceptions = options[:except] || []
+    hashrate_multiplier = options[:hashrate_multiplier] || 1
+
     raise ArgumentError, 'Range should be 0..254' unless range > 1
     raise ArgumentError, 'Range value is too high' unless range < 255
 
@@ -172,68 +224,76 @@ class Report
     
     range.times do |i|
       ip = "#{net}#{last_octet + i}"
-      json_data[ip] = Report::host_info ip
-      json_data[ip]['MHS av'] *= hashrate_multiplier if json_data[ip]['MHS av'] != nil
-      row = Report::info_to_a ip, json_data[ip]
-      data << row
+      if not exceptions.include? ip
+        json_data[ip] = Report::host_info ip
+        json_data[ip]['MHS av'] *= hashrate_multiplier if json_data[ip]['MHS av'] != nil
+        row = Report::info_to_a ip, json_data[ip]
+        data << row
+      end
     end
 
     data
   end # Report::scan_iprange
 
-  def self.run_lynx
-    lynx_data = scan_iprange "10.12.3.1", 254
-    lynx_t = table_report lynx_data
-    lynx_c = csv_report lynx_data
-
-    return lynx_t, lynx_c
+  def self.scan_lynx
+    scan_iprange "10.12.3.1", 182
   end
 
-  def self.run_alma
+  def self.scan_almenda
     alma_data = []
-    alma_ipranges = [ ["10.12.2.1", 254],
+    alma_ipranges = [ ["10.12.2.1", 142],
                       ["10.12.4.1", 254],
                       ["10.12.5.1", 254],
-                      ["10.12.6.1", 254],
-                      ["10.12.7.1", 254],
-                      ["10.12.8.1", 254] ]
+                      ["10.12.6.1", 239],
+                      ["10.12.7.1", 240],
+                      ["10.12.8.1", 242] ]
     alma_ipranges.each do |iprg|
       alma_data.concat scan_iprange iprg[0], iprg[1]
     end
 
-    alma_t = table_report alma_data
-    alma_c = csv_report alma_data
-
-    return alma_t, alma_c
+    return alma_data
   end
 
-  def self.run_china
+  def self.scan_china
     china_data = []
-    [["10.12.12.2", 253], ["10.12.13.1", 254]].each do |iprg|
-      china_data.concat scan_iprange iprg[0], iprg[1], 9
+    [["10.12.12.2", 253], ["10.12.13.1", 88, ['10.12.13.3']]].each do |iprg|
+      china_data.concat scan_iprange iprg[0], iprg[1], {:hashrate_multiplier => 9,
+                                                        :except => iprg[2]}
     end
-    china_t = table_report china_data
-    china_c = csv_report china_data
 
-    return china_t, china_c
+    return china_data
   end
 
   def self.run(conf_file)
     opts = load_opts conf_file
     today = Date.today.to_s
 
-    lynx = run_lynx
-    alma = run_alma
-    china = run_china
-    body = " Lynx\n#{lynx[0]}\n Almenda\n#{alma[0]}\n China\n#{china[0]}"
-    send(opts[:mail][:from],
-         opts[:mail][:to],
-         opts[:mail][:subject],
-         body,
-         { "lynx_report_#{today}.csv"  => lynx[1],
-           "china_report_#{today}.csv" => china[1],
-           "almenda_report_#{today}.csv"  => alma[1] },
-         opts[:smtp])
+    attmts = {}
+    body   = ''
+    data   = {}
+    report = {}
+    @@device_types.each do |dtype|
+      errputs "Scanning #{dtype.capitalize}"
+      data[dtype] = send "scan_#{dtype}"
+
+      errputs "Generating reports for #{dtype.capitalize}"
+      report[dtype] = {:table => table_report(data[dtype]),
+                       :csv   => csv_report(data[dtype])}
+
+      body << "\n #{dtype.capitalize}\n#{report[dtype][:table]}"
+      attmts["#{dtype}_report_#{today}.csv"] = report[dtype][:csv]
+    end
+
+    errputs "Generating summary report"
+    body.prepend summary_report data
+      
+    errputs "Sending mail"
+    send_report(opts[:mail][:from],
+                opts[:mail][:to],
+                opts[:mail][:subject],
+                body,
+                attmts,
+                opts[:smtp])
   end
 end
 
